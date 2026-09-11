@@ -1,26 +1,16 @@
-
 import os
-import numpy as np
 import torch
 import torch.distributed as dist
 import logging
 from collections import OrderedDict
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchdiffeq import odeint
-import matplotlib.pyplot as plt
-
-
-# =============================================================================
-#  Base-noise samplers for Flow Matching in stream-function (psi) space.
-# =============================================================================
 
 # ----------------------------- task-specific noise ------------------------- #
 def make_noise_sampler(args):
-    """x_0 基噪声采样器
-
-    - 'white'      : 零均值空间白噪声
+    """x_0 基噪声采样器.
     """
     if args.noise_type == "white":
+        # white : 零均值空间白噪声 
         def sampler(x):
             n = torch.randn_like(x)
             return n - n.mean(dim=(-2, -1), keepdim=True)
@@ -31,9 +21,10 @@ def make_noise_sampler(args):
 
 @torch.no_grad()
 def _wavenumber_grid(H: int, W: int, domain_size: float, device):
-    """Angular wavenumber |k| grid
+    """Angular wavenumber |k| grid.
 
-    k = 2*pi * fftfreq(N, d=L/N), so the physical meaning is spatial angular frequency (rad / unit length).
+    k = 2*pi * fftfreq(N, d=L/N), so the physical meaning is spatial angular
+    frequency (rad / unit length).
     """
     dx = float(domain_size) / W
     dy = float(domain_size) / H
@@ -41,47 +32,6 @@ def _wavenumber_grid(H: int, W: int, domain_size: float, device):
     ky = 2.0 * torch.pi * torch.fft.fftfreq(H, d=dy, device=device)
     ky_grid, kx_grid = torch.meshgrid(ky, kx, indexing="ij")
     return torch.sqrt(kx_grid**2 + ky_grid**2)  # (H, W)
-
-def compute_metrics(pred, target):
-    """
-    Compute MSE, MAE, PSNR, and SSIM between prediction and target.
-    
-    Args:
-        pred: [B, C, H, W] tensor
-        target: [B, C, H, W] tensor
-        
-    Returns:
-        metrics: dict containing score values
-    """
-    # MSE and MAE
-    mse         = torch.mean((pred - target) ** 2).item()
-    mae         = torch.mean(torch.abs(pred - target)).item()
-    
-    # Data range for PSNR and SSIM
-    data_range  = (target.max() - target.min()).item()
-    
-    # PSNR
-    psnr_metric = PeakSignalNoiseRatio(data_range=data_range).to(pred.device)
-    psnr        = psnr_metric(pred, target).item()
-    
-    # SSIM
-    ssim_metric = StructuralSimilarityIndexMeasure(
-        data_range=data_range,
-        kernel_size=11,
-        sigma=1.5,
-        k1=0.01,
-        k2=0.03,
-        gaussian_kernel=True
-    ).to(pred.device)
-    ssim = ssim_metric(pred, target).item()
-    
-    return {
-        'MSE': mse,
-        'MAE': mae,
-        'PSNR': psnr,
-        'SSIM': ssim
-    }
-
 
 from dataset_loader import scale_values
 
@@ -106,9 +56,8 @@ def update_ema(ema_model, model, decay=0.999):
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 def torchdiffeq_method(name):
+    """采样器名映射."""
     return {"heun": "heun2"}.get(name, name) # 非 heun 外,返回 name 本身
-
-
 
 @torch.no_grad()
 def compute_dataset_std(dataset, channel_wise=False):
@@ -186,6 +135,13 @@ class EarlyStopper:
 def cleanup_old_files(pattern: str, keep_last_n: int = 4, logger=None,
                       epoch_extractor=None):
     """Keep only the latest ``keep_last_n`` files matching ``pattern``.
+
+    Args:
+        pattern: glob pattern (e.g. ``"logs/exp/sample_*.png"``).
+        keep_last_n: how many newest files to keep.
+        logger: optional logger to record deletions.
+        epoch_extractor: callable mapping a path to an integer epoch used for
+            ordering. If None, files are sorted by name.
     """
     import glob as _glob, os as _os
     files = _glob.glob(pattern)
@@ -216,7 +172,6 @@ def create_logger(logging_dir):
     Create a logger that writes to both stdout and a file.
     If distributed is initialized, only rank 0 will log to the file.
     """
-    # Check if distributed is initialized
     is_dist = dist.is_available() and dist.is_initialized() 
     rank    = dist.get_rank() if is_dist else 0             
     
@@ -233,80 +188,14 @@ def create_logger(logging_dir):
             format="[\033[34m%(asctime)s\033[0m] %(message)s", 
             datefmt="%Y-%m-%d %H:%M:%S",
             handlers=handlers,
-            force=True # Override any existing logging configuration
+            force=True
         )
         logger = logging.getLogger(__name__)
     else:
-        # 非 Rank 0 的日志处理：只创建logger但不记录，节省资源
         logger = logging.getLogger(__name__)
-        logger.addHandler(logging.NullHandler()) # 吞掉所有日志消息，不输出任何内容
+        logger.addHandler(logging.NullHandler())
         
     return logger
-
-
-
-
-# ---------------------------------------------------------------------------
-#  分块联合生成 rollout(README §14 联合版,planb/随机视频预测.md §3.3-B/C)
-# ---------------------------------------------------------------------------
-
-class BlockFlowPredictor:
-    """分块联合生成包装器：一次 ODE 采样一整块 L 帧,窗口按块滑动。
-
-    块内帧由同一条件分布联合生成；块之间自回归（第 3 维 B + C 的
-    分块自回归部署方式）。
-    """
-
-    def __init__(self, model, block_len, noise_sampler, sampler_method="heun",
-                 ode_steps=8):
-        self.model          = model
-        self.block_len      = block_len
-        self.noise_sampler  = noise_sampler
-        self.sampler_method = sampler_method
-        self.ode_steps      = ode_steps
-
-    @torch.no_grad()
-    def _sample_block(self, context, params, dt, x0=None, reverse=False):
-        """对当前历史条件联合采样下一块 [B, L, C, H, W]。"""
-        B, K, C, H, W = context.shape
-        if x0 is None:
-            x0 = self.noise_sampler(context.new_zeros(B, self.block_len * C, H, W))
-        block = integrate_ode(
-            self.model, x0, params,
-            num_steps=self.ode_steps,
-            method=self.sampler_method,
-            reverse=reverse,
-            model_kwargs={"context": context, "params": params, "dt": dt},
-        )                                                   # [B, L*C, H, W]
-        return block.reshape(B, self.block_len, C, H, W)
-
-    @torch.no_grad()
-    def rollout(self, context, num_future_steps, params=None, dt=None,
-                forcing=None, geometry_mask=None, num_samples=1):
-        """
-        Args:
-            context: [B, K, C, H, W]
-
-        Returns:
-            num_samples=1: [B, T_future, C, H, W]
-            num_samples>1: [B, M, T_future, C, H, W]
-        """
-        B, K, C, H, W   = context.shape
-        L               = self.block_len
-
-        def _one_rollout():
-            history     = context
-            blocks      = []
-            n_blocks    = -(-num_future_steps // L)
-            for _ in range(n_blocks):
-                block   = self._sample_block(history, params, dt)
-                blocks.append(block)
-                history = torch.cat([history, block], dim=1)[:, -K:]
-            return torch.cat(blocks, dim=1)[:, :num_future_steps]
-
-        if num_samples == 1:
-            return _one_rollout()
-        return torch.stack([_one_rollout() for _ in range(num_samples)], dim=1)
 
 
 # ---------------------------------------------------------------------------
@@ -314,9 +203,6 @@ class BlockFlowPredictor:
 # ---------------------------------------------------------------------------
 class JointBlockGenerator:
     """仅联合生成(无分块 rollout 展开)：一次 ODE 采样一整块 L 帧。
-
-    与 BlockFlowPredictor 的区别：不包含 rollout/展开循环,只做单次联合生成——
-    无时间展开,计算量 = 一次 ODE 积分(O(ode_steps x F(L))),块内帧并行生成。
     """
 
     def __init__(self, model, block_len, noise_sampler, sampler_method="heun",
@@ -349,9 +235,6 @@ class JointBlockGenerator:
                     sampler_method, ode_steps, noise_sampler, block_len):
         """分块联合生成闭环 rollout:每步 ODE 联合采样 block_len 帧,窗口按块滑动。
 
-        对应训练端 BlockFlowPredictor.rollout(展开循环)。训练侧改为仅联合后,
-        本函数暂时注释保留,后续做长程分块对比时取消注释复用。
-
         Args:
             context: [B, K, C, H, W] 真实初始窗口
 
@@ -379,17 +262,14 @@ class JointBlockGenerator:
 @torch.no_grad()
 def integrate_ode(model, x0, parameters, num_steps=32, reverse=False, method="euler",
                   rtol=1e-5, atol=1e-5, model_kwargs=None):
-    """ODE-based FM sampler using torchdiffeq.
+    """ODE-based FM sampler.
 
     Methods supported: 'euler', 'heun2', 'rk4', 'dopri5'.
 
     Args:
-        model: FM 向量场。默认旧接口调用 ``model(xt, t_batch, parameters)``；
-               传入 ``model_kwargs``（如 ``dict(context=..., params=..., dt=...)``）时,
-               改为调用 ``model(xt, t_batch, **model_kwargs)``,适配
-               theory/README.md §7.1 的统一条件向量场接口。
-        x0:     初始状态 [B, ...]。
-        parameters: 标量条件（旧接口专用；新接口下经 model_kwargs 传递,此处仅占位）。
+        model: FM 向量场
+        x0:     初始状态 [B, ...]
+        parameters: 标量条件（此处仅占位）
     """
     B       = x0.shape[0]
     device  = x0.device
