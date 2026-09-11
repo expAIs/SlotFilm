@@ -12,51 +12,28 @@ import matplotlib.pyplot as plt
 
 # =============================================================================
 #  Base-noise samplers for Flow Matching in stream-function (psi) space.
-#  Used as x_0 = psi_0 in Task A:  psi_s = (1-s) psi_0 + s psi_1.
-#
-#  Why spectral shaping matters:
-#    - Pure spatial white noise carries full-spectrum energy up to the Nyquist
-#      wavenumber (N/2).  After the psi -> velocity derivative (multiply by
-#      |k| in Fourier space), the unreachable high-frequency part of
-#      v_target = psi_1 - psi_0 is amplified by |k| and cannot be represented
-#      by a truncated-mode FNO, creating an irreducible MSE floor and noisy
-#      generated samples.
-#    - Band-limiting psi_0 to |k| <= k_max (matching the FNO `modes` cutoff)
-#      keeps v_target inside the model's representable spectral subspace.
-#    - Colored noise with P(psi) ~ |k|^{-alpha} mimics the smooth decay of
-#      real stream functions, so the transport path is much more learnable.
 # =============================================================================
 
 # ----------------------------- task-specific noise ------------------------- #
 def make_noise_sampler(args):
-    """x_0 基噪声采样器(README §6.1)。
+    """x_0 基噪声采样器
 
     - 'white'      : 零均值空间白噪声
-    - 'bandlimited': 硬低通 |k| <= k_max(默认,与 FNO modes 截断匹配,
-                     README 与 fno.py 的谱分析：使 v_target 落入模型可表示子空间)
-    - 'colored'    : 幂律谱 P(x) ~ |k|^{-alpha}
     """
     if args.noise_type == "white":
         def sampler(x):
             n = torch.randn_like(x)
             return n - n.mean(dim=(-2, -1), keepdim=True)
         return sampler
-    elif args.noise_type == "bandlimited":
-        return lambda x: sample_bandlimited_gaussian_like(
-            x, k_max=args.noise_k_max, domain_size=2.0 * torch.pi)
-    elif args.noise_type == "colored":
-        return lambda x: sample_colored_gaussian_like(
-            x, alpha=args.noise_alpha, domain_size=2.0 * torch.pi)
     else:
         raise ValueError(f"Unknown noise type: {args.noise_type}")
 
 
 @torch.no_grad()
 def _wavenumber_grid(H: int, W: int, domain_size: float, device):
-    """Angular wavenumber |k| grid, same convention as PeriodicStreamFunctionCodec.
+    """Angular wavenumber |k| grid
 
-    k = 2*pi * fftfreq(N, d=L/N), so the physical meaning is spatial angular
-    frequency (rad / unit length).
+    k = 2*pi * fftfreq(N, d=L/N), so the physical meaning is spatial angular frequency (rad / unit length).
     """
     dx = float(domain_size) / W
     dy = float(domain_size) / H
@@ -64,87 +41,6 @@ def _wavenumber_grid(H: int, W: int, domain_size: float, device):
     ky = 2.0 * torch.pi * torch.fft.fftfreq(H, d=dy, device=device)
     ky_grid, kx_grid = torch.meshgrid(ky, kx, indexing="ij")
     return torch.sqrt(kx_grid**2 + ky_grid**2)  # (H, W)
-
-
-@torch.no_grad()
-def sample_bandlimited_gaussian_like(x: torch.Tensor, k_max: float,
-                                     domain_size: float = 2.0 * torch.pi) -> torch.Tensor:
-    """Hard-bandlimited base noise for psi-space Flow Matching.
-
-    White noise is low-pass filtered in Fourier space to |k| <= k_max
-    (sharp box filter), so the noise contains zero spectral energy beyond
-    k_max.  Matching k_max to the FNO `modes` cutoff makes
-    v_target = psi_1 - psi_0 exactly representable by the model.
-
-    Args:
-        x:           Reference tensor [B, C, H, W] (only shape/dtype/device used).
-        k_max:       Hard cutoff wavenumber (angular frequency).
-        domain_size: Physical domain length (default 2*pi).
-
-    Returns:
-        Noise [B, C, H, W], zero-mean and per-sample unit std.
-    """
-    B, C, H, W = x.shape
-    noise = torch.randn_like(x)                                   # real-space white noise
-    noise_hat = torch.fft.fft2(noise)
-
-    K = _wavenumber_grid(H, W, domain_size, x.device)
-    mask = (K <= float(k_max)).to(noise_hat.dtype)
-    noise_hat = noise_hat * mask
-
-    # Spectral compensation 1/|k| inside the band (avoids 1/0 at DC).
-    K_safe              = K.clamp(min=1.0).to(noise_hat.dtype)
-    noise_hat             = noise_hat / K_safe
-    
-    noise_hat[:, :, 0, 0] = 0.0                                   # zero spatial mean
-    noise = torch.fft.ifft2(noise_hat).real
-
-    # Per-sample unit std (matches psi_1 normalized to ~N(0, 1)).
-    std = noise.flatten(2).std(dim=2).clamp_min(1e-8)
-    return noise / std.view(B, C, 1, 1)
-
-
-
-# 效果级差,舍弃
-@torch.no_grad()
-def sample_colored_gaussian_like(x: torch.Tensor, alpha: float = 3.0,
-                                 domain_size: float = 2.0 * torch.pi,
-                                 k_max: float = float("inf")) -> torch.Tensor:
-    """Power-law colored base noise for psi-space Flow Matching.
-
-    Spectral amplitude ~ |k|^{-alpha/2}, i.e. power spectrum
-    P(psi) ~ |k|^{-alpha}, mimicking the smooth decay of real stream
-    functions (which typically decay like k^{-3} ~ k^{-5}).  This keeps the
-    transport path smooth and learnable without a hard cutoff; an optional
-    k_max additionally enforces a hard band limit.
-
-    Args:
-        x:           Reference tensor [B, C, H, W] (only shape/dtype/device used).
-        alpha:       Spectral decay exponent of the power spectrum (e.g. 2-4).
-        domain_size: Physical domain length (default 2*pi).
-        k_max:       Optional hard cutoff wavenumber (default: no cutoff).
-
-    Returns:
-        Noise [B, C, H, W], zero-mean and per-sample unit std.
-    """
-    B, C, H, W  = x.shape
-    noise       = torch.randn_like(x)
-    noise_hat   = torch.fft.fft2(noise)
-
-    K           = _wavenumber_grid(H, W, domain_size, x.device)
-    K_safe      = K.clamp(min=1.0)                                     # avoid 1/|k| blow-up at DC
-    noise_hat   = noise_hat / K_safe ** (float(alpha) / 2.0)
-
-    if k_max != float("inf"):
-        mask    = (K <= float(k_max)).to(noise_hat.dtype)
-        noise_hat = noise_hat * mask
-
-    noise_hat[:, :, 0, 0] = 0.0                                   # zero spatial mean
-    noise = torch.fft.ifft2(noise_hat).real
-
-    std = noise.flatten(2).std(dim=2).clamp_min(1e-8)
-    return noise / std.view(B, C, 1, 1)
-
 
 def compute_metrics(pred, target):
     """
@@ -201,10 +97,6 @@ def requires_grad(model, flag=True):
     for p in model.parameters():
         p.requires_grad = flag
 
-# def requires_grad(model, flag):
-#     for p in model.parameters():
-#         p.requires_grad_(flag)
-
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.999):
     ema_params   = OrderedDict(ema_model.named_parameters())
@@ -214,7 +106,6 @@ def update_ema(ema_model, model, decay=0.999):
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 def torchdiffeq_method(name):
-    """将 README §13 的采样器名映射为 torchdiffeq 方法名。"""
     return {"heun": "heun2"}.get(name, name) # 非 heun 外,返回 name 本身
 
 
@@ -222,10 +113,6 @@ def torchdiffeq_method(name):
 @torch.no_grad()
 def compute_dataset_std(dataset, channel_wise=False):
     """Compute the global standard deviation of HR velocity fields in a dataset.
-
-    Optimised for ``TensorDataset`` (and ``Subset`` of one) where the second
-    tensor is HR fields of shape [N, C, H, W]. Falls back to a streaming
-    two-pass computation for arbitrary datasets.
 
     Args:
         dataset: torch Dataset where each item is ``(cond, x_hr)``.
@@ -258,10 +145,6 @@ def compute_dataset_std(dataset, channel_wise=False):
 
 class EarlyStopper:
     """Classic early stopping helper.
-
-    Tracks the best metric seen so far and signals to stop when the metric
-    fails to improve by at least ``min_delta`` for ``patience`` consecutive
-    validations.
 
     Args:
         patience:  number of validations to wait without improvement.
@@ -303,13 +186,6 @@ class EarlyStopper:
 def cleanup_old_files(pattern: str, keep_last_n: int = 4, logger=None,
                       epoch_extractor=None):
     """Keep only the latest ``keep_last_n`` files matching ``pattern``.
-
-    Args:
-        pattern: glob pattern (e.g. ``"logs/exp/sample_*.png"``).
-        keep_last_n: how many newest files to keep.
-        logger: optional logger to record deletions.
-        epoch_extractor: callable mapping a path to an integer epoch used for
-            ordering. If None, files are sorted by name.
     """
     import glob as _glob, os as _os
     files = _glob.glob(pattern)
@@ -337,25 +213,24 @@ def cleanup_old_files(pattern: str, keep_last_n: int = 4, logger=None,
 
 def create_logger(logging_dir):
     """
-    分布式训练专用的日志系统
     Create a logger that writes to both stdout and a file.
     If distributed is initialized, only rank 0 will log to the file.
     """
     # Check if distributed is initialized
-    is_dist = dist.is_available() and dist.is_initialized() # 检查分布式是否已初始化（不只是可用，还要已调用init_process_group）
-    rank    = dist.get_rank() if is_dist else 0             # 未初始化时默认为 rank 0（防守单卡场景）
+    is_dist = dist.is_available() and dist.is_initialized() 
+    rank    = dist.get_rank() if is_dist else 0             
     
     if rank == 0:
-        handlers = [logging.StreamHandler()]                # 始终输出到终端
+        handlers = [logging.StreamHandler()]                
 
         if logging_dir is not None:
             os.makedirs(logging_dir, exist_ok=True)
-            handlers.append(logging.FileHandler(f"{logging_dir}/log.txt", mode='a')) # 写入文件，追加模式（mode='a'）
+            handlers.append(logging.FileHandler(f"{logging_dir}/log.txt", mode='a')) 
         
         # Configure logging
         logging.basicConfig(
             level=logging.INFO,
-            format="[\033[34m%(asctime)s\033[0m] %(message)s", # 可以考虑在日志记录时注入rank信息,[Rank %(rank)d],但是需要传入rank
+            format="[\033[34m%(asctime)s\033[0m] %(message)s", 
             datefmt="%Y-%m-%d %H:%M:%S",
             handlers=handlers,
             force=True # Override any existing logging configuration
