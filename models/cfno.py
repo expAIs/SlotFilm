@@ -1,33 +1,11 @@
 """
-2D Fourier Neural Operator for periodic Kolmogorov-flow super-resolution.
-
-References:
-    Li, Z., Kovachki, N., Azizzadenesheli, K., Liu, B., Bhattacharya, K., Stuart, A.,
-    Anandkumar, A. "Fourier Neural Operator for Parametric Partial Differential
-    Equations." ICLR 2021.
-
 Why FNO for our task:
-    - Kolmogorov flow lives on a 2*pi periodic torus; FNO's spectral convolution
-      is exactly periodic by construction (no patch boundary artefacts that
-      hurt the divergence in DiT).
-    - Energy spectrum of forced 2D turbulence concentrates at low/medium wavenumbers,
-      which matches FNO's truncated-mode design.
-    - Spectral mixing is global with O(N log N) cost; gives long-range receptive
-      field without depth, beneficial for super-resolution at 128x128.
-    - Truncated modes act as a low-pass filter -> output is smooth, derivatives
-      (used in physics_layer for hard constraint) are numerically stable.
-
-Two variants are exposed:
-    - FNO2d_SR    : regression model, outputs 2 channels [u, v].
-    - FNO2d_HARD  : hard-constraint model, outputs 3 channels [psi, u_mean, v_mean]
-                    designed to be wrapped by `physics_layer.PhysicsInformedSuperResModel`.
-
-Forward signature is kept compatible with the rest of the project:
-    model(x, timesteps=None, y=None)
-where:
-    x         : high-res tensor [B, in_channels, H, W] (or None for pure regression)
-    timesteps : optional flow-matching/diffusion timestep, embedded via sin/cos MLP
-    y         : low-res conditioning [B, in_channels, H/scale, W/scale]
+    - Kolmogorov flow lives on a 2*pi periodic torus; 
+      FNO's spectral convolution is exactly periodic by construction (no patch boundary artefacts that hurt the divergence in DiT).
+    - Energy spectrum of forced 2D turbulence concentrates at low/medium wavenumbers, which matches FNO's truncated-mode design.
+    - Spectral mixing is global with O(N log N) cost; gives long-range receptive field without depth.
+    - Truncated modes act as a low-pass filter -> output is smooth, 
+      derivatives (used in physics_layer for hard constraint) are numerically stable.
 """
 import math
 
@@ -37,31 +15,26 @@ import torch.nn.functional as F
 
 
 class SpectralConv2d(nn.Module):
-    """
-    Truncated 2D spectral convolution. Multiplies the lowest (modes1, modes2)
-    Fourier coefficients with a learnable complex weight. Periodic by construction.
+    """Truncated 2D spectral convolution.
+
+    Multiplies the lowest (modes1, modes2) Fourier coefficients with a learnable complex weight.
     """
     def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int):
         super().__init__()
-        self.in_channels  = in_channels
-        self.out_channels = out_channels
-        self.modes1       = modes1
-        self.modes2       = modes2
+        self.in_channels    = in_channels
+        self.out_channels   = out_channels
+        self.modes1         = modes1
+        self.modes2         = modes2
 
-        scale = 1.0 / (in_channels * out_channels)
+        scale               = 1.0 / (in_channels * out_channels)
         # We split complex weights into real and imaginary parts to support DDP/NCCL
-        self.weights1_real = nn.Parameter(
-            scale * torch.randn(in_channels, out_channels, modes1, modes2)
-        )
-        self.weights1_imag = nn.Parameter(
-            scale * torch.randn(in_channels, out_channels, modes1, modes2)
-        )
-        self.weights2_real = nn.Parameter(
-            scale * torch.randn(in_channels, out_channels, modes1, modes2)
-        )
-        self.weights2_imag = nn.Parameter(
-            scale * torch.randn(in_channels, out_channels, modes1, modes2)
-        )
+        self.weights1_real  = nn.Parameter(scale * torch.randn(in_channels, out_channels, modes1, modes2))
+
+        self.weights1_imag  = nn.Parameter(scale * torch.randn(in_channels, out_channels, modes1, modes2))
+
+        self.weights2_real  = nn.Parameter(scale * torch.randn(in_channels, out_channels, modes1, modes2))
+
+        self.weights2_imag  = nn.Parameter(scale * torch.randn(in_channels, out_channels, modes1, modes2))
 
     @property
     def weights1(self):
@@ -73,40 +46,42 @@ class SpectralConv2d(nn.Module):
 
     @staticmethod
     def _compl_mul2d(x, w):
-        # x: (B, in_c, M1, M2), w: (in_c, out_c, M1, M2) -> (B, out_c, M1, M2)
+        """
+        x: (B, in_c, M1, M2), w: (in_c, out_c, M1, M2) -> (B, out_c, M1, M2)
+        """
         return torch.einsum("bixy,ioxy->boxy", x, w)
 
     def apply_ft(self, x_ft, m1=None, m2=None):
-        """截断频域乘法(不含 FFT): x_ft [B, in, H, W//2+1] -> [B, out, H, W//2+1]。
+        """Truncated spectral multiplication
 
-        只填充保留 mode 的两块(rfft 布局的上半块 kx>=0 与下半块 kx<0),
-        其余频点置零 —— 与 forward 语义完全一致,供需要频域中间结果的
-        下游模块(如 Mode-wise FiLM)复用。显式 m1/m2 统一 clamp(6.txt §三.2)。
+        Only the two blocks of retained modes are filled (the upper block with kx>=0 and the lower block with kx<0 in the rfft layout), 
+        and all other frequency points are set to zero.
+        
+        It does not include the FFT, so it can be reused by downstream modules that need intermediate spectral results (e.g., Mode-wise FiLM).
+        
+        x_ft [B, in, H, W//2+1] -> [B, out, H, W//2+1].
         """
-        B, _, H, W2 = x_ft.shape
-        m1 = min(self.modes1, H // 2, m1 if m1 is not None else self.modes1)
-        m2 = min(self.modes2, W2,     m2 if m2 is not None else self.modes2)
-        out_ft = torch.zeros(B, self.out_channels, H, W2,
-                             dtype=torch.cfloat, device=x_ft.device)
-        out_ft[:, :, :m1, :m2] = self._compl_mul2d(
-            x_ft[:, :, :m1, :m2], self.weights1[:, :, :m1, :m2]
-        )
-        out_ft[:, :, -m1:, :m2] = self._compl_mul2d(
-            x_ft[:, :, -m1:, :m2], self.weights2[:, :, :m1, :m2]
-        )
+        B, _, H, W2             = x_ft.shape
+        m1                      = min(self.modes1, H // 2, m1 if m1 is not None else self.modes1)
+        m2                      = min(self.modes2, W2,     m2 if m2 is not None else self.modes2)
+        out_ft                  = torch.zeros(B, self.out_channels, H, W2, dtype=torch.cfloat, device=x_ft.device)
+
+        out_ft[:, :, :m1, :m2]  = self._compl_mul2d(x_ft[:, :, :m1, :m2], self.weights1[:, :, :m1, :m2])
+
+        out_ft[:, :, -m1:, :m2] = self._compl_mul2d(x_ft[:, :, -m1:, :m2], self.weights2[:, :, :m1, :m2])
+
         return out_ft
 
     def forward(self, x):
-        B, _, H, W = x.shape
-        out_ft = self.apply_ft(torch.fft.rfft2(x, norm="ortho"))
+        B, _, H, W  = x.shape
+        out_ft      = self.apply_ft(torch.fft.rfft2(x, norm="ortho"))
         return torch.fft.irfft2(out_ft, s=(H, W), norm="ortho")
 
 
 class FNOBlock(nn.Module):
     """
-    Standard FNO block: spectral_conv + pointwise(1x1 conv) + GELU,
-    optionally with FiLM-style modulation by a timestep embedding and/or
-    a physical-parameter embedding.
+    Standard FNO block: spectralconv2d + pointwise(1x1 conv) + GELU, 
+    optionally with FiLM-style modulation by a timestep embedding and/or a physical-parameter embedding.
     """
     def __init__(self, channels: int, modes1: int, modes2: int, time_dim: int = 0,
                  param_dim: int = 0):
@@ -114,8 +89,10 @@ class FNOBlock(nn.Module):
         self.spectral       = SpectralConv2d(channels, channels, modes1, modes2)
         self.pointwise      = nn.Conv2d(channels, channels, kernel_size=1)
         self.act            = nn.GELU()
+
         self.time_dim       = time_dim
         self.param_dim      = param_dim
+
         # t_emb and p_emb both have time_dim channels after their MLPs.
         self.cond_dim       = time_dim + (time_dim if param_dim > 0 else 0)
         if self.cond_dim > 0:
@@ -124,68 +101,62 @@ class FNOBlock(nn.Module):
             nn.init.zeros_(self.cond_proj.bias)
 
     def forward(self, x, t_emb=None, p_emb=None):
-        h = self.spectral(x) + self.pointwise(x)
+        """
+        x_  -> .
+        """
+        h                       = self.spectral(x) + self.pointwise(x)
+        # Film module
         if self.cond_dim > 0:
-            cond_list = [e for e in (t_emb, p_emb) if e is not None]
+            cond_list           = [e for e in (t_emb, p_emb) if e is not None]
             if cond_list:
-                cond = torch.cat(cond_list, dim=-1)
-                scale, shift = self.cond_proj(cond).chunk(2, dim=-1)
-                scale = scale.unsqueeze(-1).unsqueeze(-1)
-                shift = shift.unsqueeze(-1).unsqueeze(-1)
-                h = h * (1 + scale) + shift
+                cond            = torch.cat(cond_list, dim=-1)
+                scale, shift    = self.cond_proj(cond).chunk(2, dim=-1)
+                scale           = scale.unsqueeze(-1).unsqueeze(-1)
+                shift           = shift.unsqueeze(-1).unsqueeze(-1)
+                h               = h * (1 + scale) + shift
         return self.act(h)
 
 
 # =============================================================================
-# 阶段 1: Mode-wise FiLM（14.txt M2 / 13.txt §7.2）
+# Mode-wise FiLM
 # =============================================================================
 
 class ModeWiseFilm2d(nn.Module):
-    """Mode-wise FiLM: 条件依赖的 mode-wise 对角谱调制（阶段 1）。
+    """Mode-wise FiLM: Condition-dependent mode-wise diagonal spectral modulation.
 
-        ŷ_o(k) = (1 + γ_o(k;c)) ⊙ ẑ_o(k) [+ β_o(k;c)]
+        $\hat{y}_o(k) = (1 + \gamma_o(k;c)) ⊙ \hat{z}_o(k) [+ \beta_o(k;c)]$
 
-    要点:
-      - γ 为实数,作用于 rfft2 存储半谱的两个 kx 半块（上块 kx>=0 / 下块 kx<0,
-        下块行 u 与上块行 M1-u 配对）。输出经 irfft2 恒为实值;
-      - **受限 mode basis（4.txt §二.3 修正）**:增益定义在存储半谱上,不保证
-        γ(-k)=γ(k)(非径向/偶对称),因此是「受限 mode gain 算子」,而非严格的
-        k-偶对称物理算子——论文中应按此表述,不使用「完全保证 Hermitian
-        一致性」的强措辞;
-      - 低秩生成(13.txt §7.2 推荐): γ_o(k;c) = Σ_r a_{o,r}(c) φ_r(k),
-        φ_r ∈ R^{R x (M1+1) x M2} 为可学习 mode 基（行索引 = kx ∈ [0, M1],
-        含与下半块配对的 kx=M1 行）,a 由条件投影生成;
-      - 零初始化 a / β 投影 -> 初始恒等调制(退化回无条件 FNO,稳定训练);
-      - β 默认关闭(13.txt §7.2: 第一版只使用乘性 gain)。
-    输入 z_top / z_bot 可带 G 维(组/slot 维),为阶段 3 slot 模型复用预留。
+        Both $\gamma$ and $\beta$ depend on the condition c (e.g., timestep, physical parameters), but $\beta$ is not enabled:
+        - $\gamma$ is real-valued and acts on the two kx half-blocks stored by rfft2 (the upper block with $kx≥0$ and the lower block with $kx<0$, where row u of the lower block is paired with row M1-u of the upper block); the output after irfft2 is always real-valued;
+        - It is not a strictly "physically symmetric" operator: the gain is defined on the stored half-spectrum and does not guarantee $\gamma(-k)=\gamma(k)$ (i.e., not radial/even-symmetric), so it is not a strictly k-even-symmetric physical operator and does not fully guarantee Hermitian consistency; hence it is a "restricted mode gain/basis operator".
+        - It is generated by a low-rank factorization: $\gamma_o(k;c) = \sum_r a_{o,r}(c) \psi_r(k)$, which keeps the parameter count small, controllable, and low-rank.
     """
-
     def __init__(self, channels: int, modes1: int, modes2: int,
                  cond_dim: int, rank: int = 8, use_beta: bool = False,
                  per_slot: int = 1, gamma_max: float | None = None):
         super().__init__()
-        self.channels = channels
-        self.modes1   = modes1
-        self.modes2   = modes2
-        self.cond_dim = cond_dim
-        self.rank     = rank
-        self.use_beta = use_beta
-        self.per_slot = per_slot
-        assert gamma_max is None or gamma_max > 0, \
-            f"gamma_max 必须 > 0(6.txt §三.3),got {gamma_max}"
-        self.gamma_max = gamma_max     # 有界增益: γ = γ_max·tanh(γ̃)(5.txt §七);None=无界
+        self.channels   = channels
+        self.modes1     = modes1
+        self.modes2     = modes2
+        self.cond_dim   = cond_dim
+        self.rank       = rank
+        self.use_beta   = use_beta
+        self.per_slot   = per_slot
+        assert gamma_max is None or gamma_max > 0, f"gamma_max 必须 > 0(6.txt §三.3),got {gamma_max}"
+        self.gamma_max  = gamma_max
 
-        # 可学习 mode 基 φ_r(k): [R, M1+1, M2],行索引 = kx ∈ [0, M1]
-        # rank=0 时关闭调制(恒等),供仅条件化谱核的 block 复用。
-        self.phi = (nn.Parameter(0.1 * torch.randn(rank, modes1 + 1, modes2))
-                    if rank > 0 else None)
-        # per_slot: 逐 slot 系数数量(G 维,阶段 3 slot 模型);默认 1 = 无 slot 轴
-        self.a_proj = (nn.Linear(cond_dim, per_slot * channels * rank)
-                       if rank > 0 else None)
+        # Learnable mode basis $\phi_r(k)$: $[R,\ M_1+1,\ M_2]$, row index = $kx \in [0,\ M_1]$, 
+        # including the $kx=M_1$ row paired with the lower half-block; 
+        # when rank=0, the modulation is disabled ($\gamma_o(k;c)=1$, i.e., identity).
+        self.phi        = (nn.Parameter(0.1 * torch.randn(rank, modes1 + 1, modes2)) if rank > 0 else None)
+
+        # Zero-initialize the a / β condition projections -> identity modulation at initialization,
+        # degenerates to the unconditional FNO, stabilizing training
+        self.a_proj     = (nn.Linear(cond_dim, per_slot * channels * rank) if rank > 0 else None)
         if self.a_proj is not None:
             nn.init.zeros_(self.a_proj.weight)
             nn.init.zeros_(self.a_proj.bias)
-        self.b_proj = None
+        self.b_proj     = None # β is disabled by default
         if use_beta and rank > 0:
             self.b_proj = nn.Linear(cond_dim, per_slot * channels * rank)
             nn.init.zeros_(self.b_proj.weight)
@@ -193,21 +164,19 @@ class ModeWiseFilm2d(nn.Module):
 
     @staticmethod
     def _gain_halves(grid):
-        """由 kx ∈ [0, M1] 增益网格构造上下半块增益（kx 行翻转配对）。
+        """由 kx ∈ [0, M1] 增益网格构造上下半块增益(kx 行翻转配对).
 
         grid: [B, G, C, M1+1, M2],行索引 = kx。
         下块行 u ∈ [0, M1) 对应 kx = u - M1(<0;u=0 且 M1=H/2 时为 Nyquist 行),
         与上块行 j = M1 - u 配对 -> 下块增益 = 行翻转(grid) 的前 M1 行。
-        注意:仅按 kx 配对,ky 取存储半谱同索引——受限 mode gain(4.txt §二.3)。
+        注意:仅按 kx 配对,ky 取存储半谱同索引——受限 mode gain。
         """
         M1 = grid.shape[-2] - 1
         return grid[:, :, :, :M1, :], torch.flip(grid, dims=[-2])[:, :, :, :M1, :]
 
     def forward(self, z_top, z_bot, cond):
-        """z_top / z_bot: [B, C, M1', M2'] 或 [B, G, C, M1', M2'] 截断谱块。
-
-        返回同形状的调制后谱块(M1' <= modes1, M2' <= modes2,按输入截断)。
-        rank=0 时返回原样(恒等调制)。
+        """z_top / z_bot: [B, C, M1', M2'] or [B, G, C, M1', M2'], 
+        truncated spectral blocks, optionally with a G dimension (group/slot dimension), compatible with slots.
         """
         if self.rank == 0:
             return z_top, z_bot
@@ -215,27 +184,28 @@ class ModeWiseFilm2d(nn.Module):
         if is4d:
             z_top, z_bot = z_top.unsqueeze(1), z_bot.unsqueeze(1)
         B, G, C, M1, M2 = z_top.shape
-        assert G == self.per_slot, \
-            f"输入 G={G} 与构造 per_slot={self.per_slot} 不一致"
+
+        assert G == self.per_slot, f"输入 G={G} 与构造 per_slot={self.per_slot} 不一致"
+
         M1 = min(self.modes1, M1)
         M2 = min(self.modes2, M2)
         phi = self.phi[:, :M1 + 1, :M2]
 
-        a     = self.a_proj(cond).reshape(B, G, C, self.rank)
-        grid  = torch.einsum("bgcr, rxy -> bgcxy", a, phi)  # [B, G, C, M1+1, M2]
-        if self.gamma_max is not None:
-            grid = self.gamma_max * torch.tanh(grid)        # 有界增益(5.txt §七)
-        g_top, g_bot = self._gain_halves(grid)
-        z_top = z_top * (1 + g_top)
-        z_bot = z_bot * (1 + g_bot)
+        a                   = self.a_proj(cond).reshape(B, G, C, self.rank)
+        grid                = torch.einsum("bgcr, rxy -> bgcxy", a, phi)  # [B, G, C, M1+1, M2]
+        if self.gamma_max is not None: # when gamma_max is not None
+            grid            = self.gamma_max * torch.tanh(grid) # Bounded gain: $γ = γ_{max}·tanh(γ̃)$
+        g_top, g_bot        = self._gain_halves(grid)
+        z_top               = z_top * (1 + g_top)
+        z_bot               = z_bot * (1 + g_bot)
         if self.use_beta:
-            b     = self.b_proj(cond).reshape(B, G, C, self.rank)
-            bg    = torch.einsum("bgcr, rxy -> bgcxy", b, phi)
-            bt, bb = self._gain_halves(bg)
-            z_top = z_top + bt
-            z_bot = z_bot + bb
+            b               = self.b_proj(cond).reshape(B, G, C, self.rank)
+            bg              = torch.einsum("bgcr, rxy -> bgcxy", b, phi)
+            bt, bb          = self._gain_halves(bg)
+            z_top           = z_top + bt
+            z_bot           = z_bot + bb
         if is4d:
-            z_top, z_bot = z_top.squeeze(1), z_bot.squeeze(1)
+            z_top, z_bot    = z_top.squeeze(1), z_bot.squeeze(1)
         return z_top, z_bot
 
 
