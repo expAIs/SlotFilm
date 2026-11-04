@@ -13,6 +13,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def _sinusoidal_time_embedding(t: torch.Tensor, dim: int, max_period: float = 10000.0):
+    half    = dim // 2
+    freqs   = torch.exp(-math.log(max_period) * torch.arange(half, dtype=torch.float32, device=t.device) / half)
+    args    = t.float()[:, None] * freqs[None]
+    emb     = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+    return emb
 
 class SpectralConv2d(nn.Module):
     """Truncated 2D spectral convolution.
@@ -151,7 +159,8 @@ class ModeWiseFilm2d(nn.Module):
         self.phi        = (nn.Parameter(0.1 * torch.randn(rank, modes1 + 1, modes2)) if rank > 0 else None)
 
         # Zero-initialize the a / β condition projections -> identity modulation at initialization,
-        # degenerates to the unconditional FNO, stabilizing training
+        # degenerates to the unconditional FNO, stabilizing training,
+        # all conditional paths are zero-initialized -> initially equivalent to an unconditional FNO block.
         self.a_proj     = (nn.Linear(cond_dim, per_slot * channels * rank) if rank > 0 else None)
         if self.a_proj is not None:
             nn.init.zeros_(self.a_proj.weight)
@@ -164,12 +173,14 @@ class ModeWiseFilm2d(nn.Module):
 
     @staticmethod
     def _gain_halves(grid):
-        """由 kx ∈ [0, M1] 增益网格构造上下半块增益(kx 行翻转配对).
-
-        grid: [B, G, C, M1+1, M2],行索引 = kx。
-        下块行 u ∈ [0, M1) 对应 kx = u - M1(<0;u=0 且 M1=H/2 时为 Nyquist 行),
-        与上块行 j = M1 - u 配对 -> 下块增益 = 行翻转(grid) 的前 M1 行。
-        注意:仅按 kx 配对,ky 取存储半谱同索引——受限 mode gain。
+        """Build the upper/lower half-block gains from the gain grid.
+            grid: [B, G, C, M1+1, M2], row index = kx.
+            Upper half: kx >= 0, use grid as is.
+            Lower half: kx < 0, don't generate separately — reuse the upper half with a kx flip:
+            - lower row u (kx = u-M1 < 0) pairs with upper row M1-u (flipped);
+            - i.e. lower gains = first M1 rows of the row-flipped grid.
+            - Note: u=0 with M1=H/2 is the Nyquist row, handle with care.
+            Note: flip kx only; ky keeps the same index as the stored half-spectrum a "restricted mode gain".
         """
         M1 = grid.shape[-2] - 1
         return grid[:, :, :, :M1, :], torch.flip(grid, dims=[-2])[:, :, :, :M1, :]
@@ -185,7 +196,7 @@ class ModeWiseFilm2d(nn.Module):
             z_top, z_bot = z_top.unsqueeze(1), z_bot.unsqueeze(1)
         B, G, C, M1, M2 = z_top.shape
 
-        assert G == self.per_slot, f"输入 G={G} 与构造 per_slot={self.per_slot} 不一致"
+        assert G == self.per_slot, f"Input G={G} is inconsistent with the constructed per_slot={self.per_slot}"
 
         M1 = min(self.modes1, M1)
         M2 = min(self.modes2, M2)
@@ -193,8 +204,8 @@ class ModeWiseFilm2d(nn.Module):
 
         a                   = self.a_proj(cond).reshape(B, G, C, self.rank)
         grid                = torch.einsum("bgcr, rxy -> bgcxy", a, phi)  # [B, G, C, M1+1, M2]
-        if self.gamma_max is not None: # when gamma_max is not None
-            grid            = self.gamma_max * torch.tanh(grid) # Bounded gain: $γ = γ_{max}·tanh(γ̃)$
+        if self.gamma_max is not None:                              # when gamma_max is not None
+            grid            = self.gamma_max * torch.tanh(grid)     # Bounded gain: $γ = γ_{max}·tanh(γ̃)$
         g_top, g_bot        = self._gain_halves(grid)
         z_top               = z_top * (1 + g_top)
         z_bot               = z_bot * (1 + g_bot)
@@ -210,290 +221,65 @@ class ModeWiseFilm2d(nn.Module):
 
 
 class FNOBlockModeFilm(nn.Module):
-    """FNO block + Mode-wise FiLM（频域,谱层输出上调制），可选条件化谱核。
+    """FNO block + Mode-wise FiLM
 
-        结构: h = GELU( irfft2( 调制( W(k;c) ⊛ x̂(k) ) ) + W_1(x) )
-
-    与 FNOBlock 相同的条件约定: t_emb / p_emb 拼接为 cond。所有条件路径
-    零初始化 -> 初始等价于无条件 FNO block。
-
-    Args:
-        film_rank:      mode-wise FiLM 的 mode 基数量;0 = 关闭(仅保留谱核条件化)
-        kernel_rank:    条件化谱核基数量;0 = 固定谱核 W_0（默认）
-        kernel_form / channel_low_rank: 见 ConditionalSpectralConv2d
+        h = GELU( irfft2( module( W(k) ⊛ x̂(k) ) ) + W_1(x) )
     """
 
     def __init__(self, channels: int, modes1: int, modes2: int,
                  time_dim: int = 0, param_dim: int = 0,
                  film_rank: int = 8, use_beta: bool = False,
-                 kernel_rank: int = 0, kernel_form: str = "basis",
-                 channel_low_rank: int | None = None,
-                 gamma_max: float | None = None,
-                 kernel_coeff_max: float | None = None):
+                 gamma_max: float | None = None):
         super().__init__()
-        self.channels  = channels
-        self.pointwise = nn.Conv2d(channels, channels, kernel_size=1)
-        self.act       = nn.GELU()
-        self.time_dim  = time_dim
-        self.param_dim = param_dim
-        self.kernel_rank = kernel_rank
-        # t_emb 与 p_emb 均为 time_dim 维,拼接后为 cond。
-        self.cond_dim  = time_dim + (time_dim if param_dim > 0 else 0)
-        if kernel_rank > 0:
-            # 阶段 2: 条件化谱核 W(k;c) = W_0(k) + Σ_r a_r(c) W_r(k)
-            self.spectral = ConditionalSpectralConv2d(
-                channels, channels, modes1, modes2, self.cond_dim,
-                basis_rank=kernel_rank, kernel_form=kernel_form,
-                channel_low_rank=channel_low_rank,
-                kernel_coeff_max=kernel_coeff_max)
-        else:
-            self.spectral = SpectralConv2d(channels, channels, modes1, modes2)
-        # 阶段 1: mode-wise FiLM(film_rank=0 时为恒等)
-        self.mode_film = ModeWiseFilm2d(channels, modes1, modes2, self.cond_dim,
-                                        rank=film_rank, use_beta=use_beta,
-                                        gamma_max=gamma_max)
+        self.channels   = channels
+        self.pointwise  = nn.Conv2d(channels, channels, kernel_size=1)
+        self.act        = nn.GELU()
+        self.time_dim   = time_dim
+        self.param_dim  = param_dim
+        # Both t_emb and p_emb, its dim is all the time_dim, so concat is 2xtime_dim
+        self.cond_dim   = time_dim + (time_dim if param_dim > 0 else 0)
+        self.spectral   = SpectralConv2d(channels, channels, modes1, modes2)
+        
+        # mode-wise FiLM(when film_rank=0 is equivalent)
+        self.mode_film  = ModeWiseFilm2d(channels, modes1, modes2, self.cond_dim, rank=film_rank, use_beta=use_beta, gamma_max=gamma_max)
 
     def forward(self, x, t_emb=None, p_emb=None):
-        B, _, H, W = x.shape
-        cond_list = [e for e in (t_emb, p_emb) if e is not None]
+        
+        B, _, H, W  = x.shape
+        cond_list   = [e for e in (t_emb, p_emb) if e is not None]
         if cond_list:
-            cond = torch.cat(cond_list, dim=-1)
+            cond    = torch.cat(cond_list, dim=-1)
         else:
-            cond = torch.zeros(B, self.cond_dim, device=x.device, dtype=x.dtype)
+            cond    = torch.zeros(B, self.cond_dim, device=x.device, dtype=x.dtype)
 
-        x_ft   = torch.fft.rfft2(x, norm="ortho")               # [B, C, H, W//2+1]
-        if self.kernel_rank > 0:
-            out_ft = self.spectral.apply_ft(x_ft, cond)         # 条件化谱卷积
-        else:
-            out_ft = self.spectral.apply_ft(x_ft)               # 截断谱卷积
-        m1     = min(self.spectral.modes1, H // 2)
-        m2     = min(self.spectral.modes2, W // 2 + 1)
-        top, bot = self.mode_film(out_ft[:, :, :m1, :m2],
-                                  out_ft[:, :, -m1:, :m2], cond)
-        # 用新张量组装(勿写回 out_ft: top/bot 是其视图,原地写会破坏反传图)
-        q_ft   = torch.zeros_like(out_ft)
-        q_ft[:, :, :m1, :m2]   = top
-        q_ft[:, :, -m1:, :m2]  = bot
-        q = torch.fft.irfft2(q_ft, s=(H, W), norm="ortho")
+        # FFT
+        x_ft        = torch.fft.rfft2(x, norm="ortho")          # [B, C, H, W//2+1]
+        
+        # Truncated Spectral Convolution
+        out_ft      = self.spectral.apply_ft(x_ft)              
+        
+        # ModeWiseFilm2d
+        m1          = min(self.spectral.modes1, H // 2)
+        m2          = min(self.spectral.modes2, W // 2 + 1)
+        top, bot    = self.mode_film(out_ft[:, :, :m1, :m2], out_ft[:, :, -m1:, :m2], cond)
+
+        # Assemble with a new tensor
+        # do not write back to out_ft: top/bot are views of it, and in-place writes will break the backward graph
+        q_ft        = torch.zeros_like(out_ft)
+        q_ft[:, :, :m1, :m2]    = top
+        q_ft[:, :, -m1:, :m2]   = bot
+        q           = torch.fft.irfft2(q_ft, s=(H, W), norm="ortho")
+
+        # act(fconv + pwconv)
         return self.act(q + self.pointwise(x))
 
 
-# =============================================================================
-# 阶段 2: 条件化谱核（14.txt M3 / 13.txt §7.4）
-# =============================================================================
-
-class ConditionalSpectralConv2d(nn.Module):
-    """条件化谱核（阶段 2）: W_eff(k;c) = W_0(k) + Σ_{r=1}^{R} a_r(c) W_r(k)。
-
-    - W_0 与 SpectralConv2d 同约定: 复权重拆实/虚部(兼容 DDP/NCCL),上下
-      两个 Hermitian 半块(rfft 布局 kx>=0 / kx<0)各一套权重;
-    - W_r 为可学习谱核基;条件系数 a_r = a_proj(cond) 零初始化 ->
-      W_eff = W_0,初始严格退化为无条件谱卷积(稳定训练,14.txt §四);
-    - kernel_form="basis"（默认）: 逐 r 施加基核后加权求和
-      （内存友好,不物化 batch 依赖核;13.txt §7.4 的循环实现）;
-    - kernel_form="channel_low_rank": W_r = U_r V_r^H（q=channel_low_rank),
-      两步 einsum 降低参数量与显存（13.txt §7.4 推荐的内存优化形式）。
-
-    forward 签名与 SpectralConv2d 对齐:
-        apply_ft(x_ft, cond=None) : rfft 布局截断频域乘法
-        forward(x, cond=None)      : 完整 谱卷积 + irfft2
-    """
-
-    def __init__(self, in_channels: int, out_channels: int,
-                 modes1: int, modes2: int, cond_dim: int,
-                 basis_rank: int = 4, kernel_form: str = "basis",
-                 channel_low_rank: int | None = None,
-                 kernel_coeff_max: float | None = None):
-        super().__init__()
-        assert kernel_form in ("basis", "channel_low_rank"), \
-            f"未知 kernel_form: {kernel_form}"
-        assert kernel_coeff_max is None or kernel_coeff_max > 0, \
-            f"kernel_coeff_max 必须 > 0(21.txt §一),got {kernel_coeff_max}"
-        self.in_channels  = in_channels
-        self.out_channels = out_channels
-        self.modes1       = modes1
-        self.modes2       = modes2
-        self.cond_dim     = cond_dim
-        self.basis_rank   = basis_rank
-        self.kernel_form  = kernel_form
-        self.channel_low_rank = channel_low_rank
-        self.kernel_coeff_max = kernel_coeff_max
-        # a_r(c) = kernel_coeff_max * tanh(ã_r(c)); None = unbounded(21.txt §一)
-
-        scale = 1.0 / (in_channels * out_channels)
-        # W_0: 基础谱核(与 SpectralConv2d 同约定)
-        self.w0_1_real = nn.Parameter(scale * torch.randn(in_channels, out_channels, modes1, modes2))
-        self.w0_1_imag = nn.Parameter(scale * torch.randn(in_channels, out_channels, modes1, modes2))
-        self.w0_2_real = nn.Parameter(scale * torch.randn(in_channels, out_channels, modes1, modes2))
-        self.w0_2_imag = nn.Parameter(scale * torch.randn(in_channels, out_channels, modes1, modes2))
-
-        if basis_rank > 0:
-            bscale = scale / math.sqrt(max(basis_rank, 1))
-            if kernel_form == "basis":
-                # W_r: [R, in, out, M1, M2] 完整基核
-                self.basis1_real = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, out_channels, modes1, modes2))
-                self.basis1_imag = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, out_channels, modes1, modes2))
-                self.basis2_real = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, out_channels, modes1, modes2))
-                self.basis2_imag = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, out_channels, modes1, modes2))
-            else:
-                # W_r = U_r V_r^H: U [R, in, q, M1, M2], V [R, out, q, M1, M2]
-                q = channel_low_rank or max(in_channels // 4, 1)
-                self.u1_real = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, q, modes1, modes2))
-                self.u1_imag = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, q, modes1, modes2))
-                self.v1_real = nn.Parameter(bscale * torch.randn(basis_rank, out_channels, q, modes1, modes2))
-                self.v1_imag = nn.Parameter(bscale * torch.randn(basis_rank, out_channels, q, modes1, modes2))
-                self.u2_real = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, q, modes1, modes2))
-                self.u2_imag = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, q, modes1, modes2))
-                self.v2_real = nn.Parameter(bscale * torch.randn(basis_rank, out_channels, q, modes1, modes2))
-                self.v2_imag = nn.Parameter(bscale * torch.randn(basis_rank, out_channels, q, modes1, modes2))
-                self.channel_low_rank = q
-                # 不再使用UV校准，对结果影响不大
-                # 初始化尺度校准(7.txt §七.3/§八): 旧尺度下
-                # RMS(U_rV_r^H) ≈ √q·(bscale√2)² << RMS(W_r^basis) = bscale√2,
-                # 导致 lowrank 条件核欠激活(ΔW/W₀ 仅 0.04-0.18 vs basis 0.72-0.95)。
-                # 逐 r 缩放 U_r 与 V_r,使外积 RMS 对齐 basis 目标尺度。
-                # with torch.no_grad():
-                #     target_rms = bscale * math.sqrt(2.0)
-                #     for (u_re, u_im, v_re, v_im) in (
-                #             (self.u1_real, self.u1_imag, self.v1_real, self.v1_imag),
-                #             (self.u2_real, self.u2_imag, self.v2_real, self.v2_imag)):
-                #         for r in range(basis_rank):
-                #             W_r = torch.einsum(
-                #                 "iqxy,oqxy->ioxy",
-                #                 torch.complex(u_re[r], u_im[r]),
-                #                 torch.complex(v_re[r], v_im[r]).conj())
-                #             rms_r = float(W_r.abs().square().mean().sqrt())
-                #             s_r = math.sqrt(target_rms / max(rms_r, 1e-12))
-                #             s_r = min(max(s_r, 0.01), 100.0)
-                #             for p in (u_re, u_im, v_re, v_im):
-                #                 p.data[r] = p.data[r] * s_r
-            # 条件系数 a_r(c),零初始化 -> 初始退化为 W_0
-            self.a_proj = nn.Linear(cond_dim, basis_rank)
-            nn.init.zeros_(self.a_proj.weight)
-            nn.init.zeros_(self.a_proj.bias)
-        else:
-            self.a_proj = None
-
-    @property
-    def w0_1(self):
-        return torch.complex(self.w0_1_real, self.w0_1_imag)
-
-    @property
-    def w0_2(self):
-        return torch.complex(self.w0_2_real, self.w0_2_imag)
-
-    @property
-    def basis1(self):
-        return torch.complex(self.basis1_real, self.basis1_imag)
-
-    @property
-    def basis2(self):
-        return torch.complex(self.basis2_real, self.basis2_imag)
-
-    @property
-    def u1(self):
-        return torch.complex(self.u1_real, self.u1_imag)
-
-    @property
-    def v1(self):
-        return torch.complex(self.v1_real, self.v1_imag)
-
-    @property
-    def u2(self):
-        return torch.complex(self.u2_real, self.u2_imag)
-
-    @property
-    def v2(self):
-        return torch.complex(self.v2_real, self.v2_imag)
-
-    @staticmethod
-    def _compl_mul2d(x, w):
-        # x: (B, in_c, M1, M2), w: (in_c, out_c, M1, M2) -> (B, out_c, M1, M2)
-        return torch.einsum("bixy,ioxy->boxy", x, w)
-
-    def _kernel_apply(self, x_top, x_bot, a):
-        """条件残差 ΔW(k;c) ⊛ x̂,返回 (delta_top, delta_bot)。
-
-        基核/低秩因子按输入实际截断 (m1, m2) 切片(与 apply_ft 中基权重
-        weights1/2 的截断语义一致;分辨率 < 模板 modes 时避免尺寸错配)。
-        """
-        B = x_top.shape[0]
-        m1 = x_top.shape[-2]
-        m2 = x_top.shape[-1]
-        if self.kernel_form == "basis":
-            delta_top = torch.zeros_like(x_top)
-            delta_bot = torch.zeros_like(x_bot)
-            for r in range(self.basis_rank):
-                ar = a[:, r].view(B, 1, 1, 1)
-                delta_top = delta_top + ar * self._compl_mul2d(
-                    x_top, self.basis1[r][:, :, :m1, :m2])
-                delta_bot = delta_bot + ar * self._compl_mul2d(
-                    x_bot, self.basis2[r][:, :, :m1, :m2])
-            return delta_top, delta_bot
-        # channel_low_rank: ΔW = Σ_r a_r U_r V_r^H,先逐 r 投影再按 a_r 加权
-        # (修复 4.txt §三.2:旧实现把 a 同时乘到 U/V 两侧,产生 a_r^2 与交叉项)。
-        u1, v1 = self.u1[:, :, :, :m1, :m2], self.v1[:, :, :, :m1, :m2]
-        u2, v2 = self.u2[:, :, :, :m1, :m2], self.v2[:, :, :, :m1, :m2]
-        a_c = a.to(self.u1.dtype)                       # [B, R] 复数系数(仅加权用)
-        ux = torch.einsum("bixy, riqxy -> brqxy", x_top, u1)
-        delta_r = torch.einsum("brqxy, roqxy -> broxy",
-                               ux, torch.conj(v1))
-        delta_top = torch.einsum("br, broxy -> boxy", a_c, delta_r)
-        ux = torch.einsum("bixy, riqxy -> brqxy", x_bot, u2)
-        delta_r = torch.einsum("brqxy, roqxy -> broxy",
-                               ux, torch.conj(v2))
-        delta_bot = torch.einsum("br, broxy -> boxy", a_c, delta_r)
-        return delta_top, delta_bot
-
-    def apply_ft(self, x_ft, cond=None, m1=None, m2=None):
-        """截断频域乘法(不含 FFT): x_ft [B, in, H, W//2+1] -> [B, out, H, W//2+1]。
-
-        与 SpectralConv2d.apply_ft 语义一致;cond 给出时叠加条件残差核。
-        """
-        B, _, H, W2 = x_ft.shape
-        m1 = min(self.modes1, H // 2, m1 if m1 is not None else self.modes1)
-        m2 = min(self.modes2, W2,     m2 if m2 is not None else self.modes2)
-        x_top = x_ft[:, :, :m1, :m2]
-        x_bot = x_ft[:, :, -m1:, :m2]
-        out_top = self._compl_mul2d(x_top, self.w0_1[:, :, :m1, :m2])
-        out_bot = self._compl_mul2d(x_bot, self.w0_2[:, :, :m1, :m2])
-        if self.a_proj is not None and cond is not None:
-            a = self.a_proj(cond)                       # [B, R]
-            if self.kernel_coeff_max is not None:
-                a = self.kernel_coeff_max * torch.tanh(a)  # 系数有界门控(21.txt §一)
-            d_top, d_bot = self._kernel_apply(x_top, x_bot, a)
-            out_top = out_top + d_top
-            out_bot = out_bot + d_bot
-        out_ft = torch.zeros(B, self.out_channels, H, W2,
-                             dtype=torch.cfloat, device=x_ft.device)
-        out_ft[:, :, :m1, :m2]  = out_top
-        out_ft[:, :, -m1:, :m2] = out_bot
-        return out_ft
-
-    def forward(self, x, cond=None):
-        B, _, H, W = x.shape
-        out_ft = self.apply_ft(torch.fft.rfft2(x, norm="ortho"), cond)
-        return torch.fft.irfft2(out_ft, s=(H, W), norm="ortho")
-
-
-def _sinusoidal_time_embedding(t: torch.Tensor, dim: int, max_period: float = 10000.0):
-    half    = dim // 2
-    freqs   = torch.exp(
-        -math.log(max_period) * torch.arange(half, dtype=torch.float32, device=t.device) / half
-    )
-    args    = t.float()[:, None] * freqs[None]
-    emb     = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2:
-        emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
-    return emb
-
-
 class FNO2d(nn.Module):
-    """
+    """    
     Backbone:
         Lift (1x1 conv): in_channels   -> width
-        N x FNOBlock  : width          -> width
-        Project       : width          -> 128 -> out_channels (two 1x1 convs + GELU)
+        N x FNOBlock   : width         -> width
+        Project        : width         -> 128 -> out_channels (two 1x1 convs + GELU)
 
     Conditioning on low-res input is done by bilinear-upsampling y to the target
     resolution and concatenating along the channel dimension before the lift.
@@ -510,28 +296,26 @@ class FNO2d(nn.Module):
         cond_in_channels: int = 2,
     ):
         super().__init__()
-        self.in_channels      = in_channels
-        self.cond_in_channels = cond_in_channels
-        self.out_channels     = out_channels
-        self.use_lr_shortcut  = use_lr_shortcut
-        self.time_dim         = time_dim
+        self.in_channels        = in_channels
+        self.cond_in_channels   = cond_in_channels
+        self.out_channels       = out_channels
+        self.use_lr_shortcut    = use_lr_shortcut
+        self.time_dim           = time_dim
 
         # Time/timestep embedding (used only when timesteps is not None).
-        self.t_mlp = nn.Sequential(
+        self.t_mlp              = nn.Sequential(
             nn.Linear(time_dim, time_dim),
             nn.SiLU(),
             nn.Linear(time_dim, time_dim),
         )
 
         # Lift: x and upsampled y are concatenated -> 2 * cond_in_channels channels (or in+cond).
-        lift_in = in_channels + cond_in_channels + 2  # +2 for grid (x, y) coords
-        self.lift = nn.Conv2d(lift_in, width, kernel_size=1)
+        lift_in                 = in_channels + cond_in_channels + 2  # +2 for grid (x, y) coords
+        self.lift               = nn.Conv2d(lift_in, width, kernel_size=1)
 
-        self.blocks = nn.ModuleList([
-            FNOBlock(width, modes, modes, time_dim=time_dim) for _ in range(depth)
-        ])
+        self.blocks             = nn.ModuleList([FNOBlock(width, modes, modes, time_dim=time_dim) for _ in range(depth)])
 
-        self.proj = nn.Sequential(
+        self.proj               = nn.Sequential(
             nn.Conv2d(width, 128, kernel_size=1),
             nn.GELU(),
             nn.Conv2d(128, out_channels, kernel_size=1),
@@ -544,10 +328,10 @@ class FNO2d(nn.Module):
 
     @staticmethod
     def _grid(B: int, H: int, W: int, device, dtype):
-        gx = torch.arange(H, device=device, dtype=dtype) / H
-        gy = torch.arange(W, device=device, dtype=dtype) / W
-        gx, gy = torch.meshgrid(gx, gy, indexing='ij')
-        grid = torch.stack([gx, gy], dim=0).unsqueeze(0).expand(B, -1, -1, -1)
+        gx      = torch.arange(H, device=device, dtype=dtype) / H
+        gy      = torch.arange(W, device=device, dtype=dtype) / W
+        gx, gy  = torch.meshgrid(gx, gy, indexing='ij')
+        grid    = torch.stack([gx, gy], dim=0).unsqueeze(0).expand(B, -1, -1, -1)
         return grid
 
     def forward(self, x, timesteps=None, y=None, **kwargs):
@@ -1571,6 +1355,206 @@ def build_cond_fno(cond_mode: str = "global_film", size: str = "b",
     return cls(state_channels=state_channels, context_len=context_len,
                block_len=block_len, param_dim=param_dim,
                image_size=image_size, **cfg)
+
+
+# =============================================================================
+# Conditional Spectral Convolution
+# =============================================================================
+
+class ConditionalSpectralConv2d(nn.Module):
+    """条件化谱核（阶段 2）: W_eff(k;c) = W_0(k) + Σ_{r=1}^{R} a_r(c) W_r(k)。
+
+    - W_0 与 SpectralConv2d 同约定: 复权重拆实/虚部(兼容 DDP/NCCL),上下
+      两个 Hermitian 半块(rfft 布局 kx>=0 / kx<0)各一套权重;
+    - W_r 为可学习谱核基;条件系数 a_r = a_proj(cond) 零初始化 ->
+      W_eff = W_0,初始严格退化为无条件谱卷积(稳定训练,14.txt §四);
+    - kernel_form="basis"（默认）: 逐 r 施加基核后加权求和
+      （内存友好,不物化 batch 依赖核;13.txt §7.4 的循环实现）;
+    - kernel_form="channel_low_rank": W_r = U_r V_r^H（q=channel_low_rank),
+      两步 einsum 降低参数量与显存（13.txt §7.4 推荐的内存优化形式）。
+
+    forward 签名与 SpectralConv2d 对齐:
+        apply_ft(x_ft, cond=None) : rfft 布局截断频域乘法
+        forward(x, cond=None)      : 完整 谱卷积 + irfft2
+    """
+
+    def __init__(self, in_channels: int, out_channels: int,
+                 modes1: int, modes2: int, cond_dim: int,
+                 basis_rank: int = 4, kernel_form: str = "basis",
+                 channel_low_rank: int | None = None,
+                 kernel_coeff_max: float | None = None):
+        super().__init__()
+        assert kernel_form in ("basis", "channel_low_rank"), \
+            f"未知 kernel_form: {kernel_form}"
+        assert kernel_coeff_max is None or kernel_coeff_max > 0, \
+            f"kernel_coeff_max 必须 > 0(21.txt §一),got {kernel_coeff_max}"
+        self.in_channels  = in_channels
+        self.out_channels = out_channels
+        self.modes1       = modes1
+        self.modes2       = modes2
+        self.cond_dim     = cond_dim
+        self.basis_rank   = basis_rank
+        self.kernel_form  = kernel_form
+        self.channel_low_rank = channel_low_rank
+        self.kernel_coeff_max = kernel_coeff_max
+        # a_r(c) = kernel_coeff_max * tanh(ã_r(c)); None = unbounded(21.txt §一)
+
+        scale = 1.0 / (in_channels * out_channels)
+        # W_0: 基础谱核(与 SpectralConv2d 同约定)
+        self.w0_1_real = nn.Parameter(scale * torch.randn(in_channels, out_channels, modes1, modes2))
+        self.w0_1_imag = nn.Parameter(scale * torch.randn(in_channels, out_channels, modes1, modes2))
+        self.w0_2_real = nn.Parameter(scale * torch.randn(in_channels, out_channels, modes1, modes2))
+        self.w0_2_imag = nn.Parameter(scale * torch.randn(in_channels, out_channels, modes1, modes2))
+
+        if basis_rank > 0:
+            bscale = scale / math.sqrt(max(basis_rank, 1))
+            if kernel_form == "basis":
+                # W_r: [R, in, out, M1, M2] 完整基核
+                self.basis1_real = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, out_channels, modes1, modes2))
+                self.basis1_imag = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, out_channels, modes1, modes2))
+                self.basis2_real = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, out_channels, modes1, modes2))
+                self.basis2_imag = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, out_channels, modes1, modes2))
+            else:
+                # W_r = U_r V_r^H: U [R, in, q, M1, M2], V [R, out, q, M1, M2]
+                q = channel_low_rank or max(in_channels // 4, 1)
+                self.u1_real = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, q, modes1, modes2))
+                self.u1_imag = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, q, modes1, modes2))
+                self.v1_real = nn.Parameter(bscale * torch.randn(basis_rank, out_channels, q, modes1, modes2))
+                self.v1_imag = nn.Parameter(bscale * torch.randn(basis_rank, out_channels, q, modes1, modes2))
+                self.u2_real = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, q, modes1, modes2))
+                self.u2_imag = nn.Parameter(bscale * torch.randn(basis_rank, in_channels, q, modes1, modes2))
+                self.v2_real = nn.Parameter(bscale * torch.randn(basis_rank, out_channels, q, modes1, modes2))
+                self.v2_imag = nn.Parameter(bscale * torch.randn(basis_rank, out_channels, q, modes1, modes2))
+                self.channel_low_rank = q
+                # 不再使用UV校准，对结果影响不大
+                # 初始化尺度校准(7.txt §七.3/§八): 旧尺度下
+                # RMS(U_rV_r^H) ≈ √q·(bscale√2)² << RMS(W_r^basis) = bscale√2,
+                # 导致 lowrank 条件核欠激活(ΔW/W₀ 仅 0.04-0.18 vs basis 0.72-0.95)。
+                # 逐 r 缩放 U_r 与 V_r,使外积 RMS 对齐 basis 目标尺度。
+                # with torch.no_grad():
+                #     target_rms = bscale * math.sqrt(2.0)
+                #     for (u_re, u_im, v_re, v_im) in (
+                #             (self.u1_real, self.u1_imag, self.v1_real, self.v1_imag),
+                #             (self.u2_real, self.u2_imag, self.v2_real, self.v2_imag)):
+                #         for r in range(basis_rank):
+                #             W_r = torch.einsum(
+                #                 "iqxy,oqxy->ioxy",
+                #                 torch.complex(u_re[r], u_im[r]),
+                #                 torch.complex(v_re[r], v_im[r]).conj())
+                #             rms_r = float(W_r.abs().square().mean().sqrt())
+                #             s_r = math.sqrt(target_rms / max(rms_r, 1e-12))
+                #             s_r = min(max(s_r, 0.01), 100.0)
+                #             for p in (u_re, u_im, v_re, v_im):
+                #                 p.data[r] = p.data[r] * s_r
+            # 条件系数 a_r(c),零初始化 -> 初始退化为 W_0
+            self.a_proj = nn.Linear(cond_dim, basis_rank)
+            nn.init.zeros_(self.a_proj.weight)
+            nn.init.zeros_(self.a_proj.bias)
+        else:
+            self.a_proj = None
+
+    @property
+    def w0_1(self):
+        return torch.complex(self.w0_1_real, self.w0_1_imag)
+
+    @property
+    def w0_2(self):
+        return torch.complex(self.w0_2_real, self.w0_2_imag)
+
+    @property
+    def basis1(self):
+        return torch.complex(self.basis1_real, self.basis1_imag)
+
+    @property
+    def basis2(self):
+        return torch.complex(self.basis2_real, self.basis2_imag)
+
+    @property
+    def u1(self):
+        return torch.complex(self.u1_real, self.u1_imag)
+
+    @property
+    def v1(self):
+        return torch.complex(self.v1_real, self.v1_imag)
+
+    @property
+    def u2(self):
+        return torch.complex(self.u2_real, self.u2_imag)
+
+    @property
+    def v2(self):
+        return torch.complex(self.v2_real, self.v2_imag)
+
+    @staticmethod
+    def _compl_mul2d(x, w):
+        # x: (B, in_c, M1, M2), w: (in_c, out_c, M1, M2) -> (B, out_c, M1, M2)
+        return torch.einsum("bixy,ioxy->boxy", x, w)
+
+    def _kernel_apply(self, x_top, x_bot, a):
+        """条件残差 ΔW(k;c) ⊛ x̂,返回 (delta_top, delta_bot)。
+
+        基核/低秩因子按输入实际截断 (m1, m2) 切片(与 apply_ft 中基权重
+        weights1/2 的截断语义一致;分辨率 < 模板 modes 时避免尺寸错配)。
+        """
+        B = x_top.shape[0]
+        m1 = x_top.shape[-2]
+        m2 = x_top.shape[-1]
+        if self.kernel_form == "basis":
+            delta_top = torch.zeros_like(x_top)
+            delta_bot = torch.zeros_like(x_bot)
+            for r in range(self.basis_rank):
+                ar = a[:, r].view(B, 1, 1, 1)
+                delta_top = delta_top + ar * self._compl_mul2d(
+                    x_top, self.basis1[r][:, :, :m1, :m2])
+                delta_bot = delta_bot + ar * self._compl_mul2d(
+                    x_bot, self.basis2[r][:, :, :m1, :m2])
+            return delta_top, delta_bot
+        # channel_low_rank: ΔW = Σ_r a_r U_r V_r^H,先逐 r 投影再按 a_r 加权
+        # (修复 4.txt §三.2:旧实现把 a 同时乘到 U/V 两侧,产生 a_r^2 与交叉项)。
+        u1, v1 = self.u1[:, :, :, :m1, :m2], self.v1[:, :, :, :m1, :m2]
+        u2, v2 = self.u2[:, :, :, :m1, :m2], self.v2[:, :, :, :m1, :m2]
+        a_c = a.to(self.u1.dtype)                       # [B, R] 复数系数(仅加权用)
+        ux = torch.einsum("bixy, riqxy -> brqxy", x_top, u1)
+        delta_r = torch.einsum("brqxy, roqxy -> broxy",
+                               ux, torch.conj(v1))
+        delta_top = torch.einsum("br, broxy -> boxy", a_c, delta_r)
+        ux = torch.einsum("bixy, riqxy -> brqxy", x_bot, u2)
+        delta_r = torch.einsum("brqxy, roqxy -> broxy",
+                               ux, torch.conj(v2))
+        delta_bot = torch.einsum("br, broxy -> boxy", a_c, delta_r)
+        return delta_top, delta_bot
+
+    def apply_ft(self, x_ft, cond=None, m1=None, m2=None):
+        """截断频域乘法(不含 FFT): x_ft [B, in, H, W//2+1] -> [B, out, H, W//2+1]。
+
+        与 SpectralConv2d.apply_ft 语义一致;cond 给出时叠加条件残差核。
+        """
+        B, _, H, W2 = x_ft.shape
+        m1 = min(self.modes1, H // 2, m1 if m1 is not None else self.modes1)
+        m2 = min(self.modes2, W2,     m2 if m2 is not None else self.modes2)
+        x_top = x_ft[:, :, :m1, :m2]
+        x_bot = x_ft[:, :, -m1:, :m2]
+        out_top = self._compl_mul2d(x_top, self.w0_1[:, :, :m1, :m2])
+        out_bot = self._compl_mul2d(x_bot, self.w0_2[:, :, :m1, :m2])
+        if self.a_proj is not None and cond is not None:
+            a = self.a_proj(cond)                       # [B, R]
+            if self.kernel_coeff_max is not None:
+                a = self.kernel_coeff_max * torch.tanh(a)  # 系数有界门控(21.txt §一)
+            d_top, d_bot = self._kernel_apply(x_top, x_bot, a)
+            out_top = out_top + d_top
+            out_bot = out_bot + d_bot
+        out_ft = torch.zeros(B, self.out_channels, H, W2,
+                             dtype=torch.cfloat, device=x_ft.device)
+        out_ft[:, :, :m1, :m2]  = out_top
+        out_ft[:, :, -m1:, :m2] = out_bot
+        return out_ft
+
+    def forward(self, x, cond=None):
+        B, _, H, W = x.shape
+        out_ft = self.apply_ft(torch.fft.rfft2(x, norm="ortho"), cond)
+        return torch.fft.irfft2(out_ft, s=(H, W), norm="ortho")
+
+
 
 
 # =============================================================================
