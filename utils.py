@@ -7,10 +7,11 @@ from torchdiffeq import odeint
 
 # ----------------------------- task-specific noise ------------------------- #
 def make_noise_sampler(args):
-    """x_0 基噪声采样器.
+    """x_0 base noise sampler.
+
+        'white' : Zero-mean spatial white noise
     """
     if args.noise_type == "white":
-        # white : 零均值空间白噪声 
         def sampler(x):
             n = torch.randn_like(x)
             return n - n.mean(dim=(-2, -1), keepdim=True)
@@ -21,7 +22,7 @@ def make_noise_sampler(args):
 
 @torch.no_grad()
 def _wavenumber_grid(H: int, W: int, domain_size: float, device):
-    """Angular wavenumber |k| grid.
+    """Angular wavenumber |k| grid, same convention as PeriodicStreamFunctionCodec.
 
     k = 2*pi * fftfreq(N, d=L/N), so the physical meaning is spatial angular
     frequency (rad / unit length).
@@ -56,12 +57,16 @@ def update_ema(ema_model, model, decay=0.999):
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 def torchdiffeq_method(name):
-    """采样器名映射."""
-    return {"heun": "heun2"}.get(name, name) # 非 heun 外,返回 name 本身
+    """Map sampler names to torchdiffeq method names."""
+    return {"heun": "heun2"}.get(name, name) # Except for non-heun, return the name itself
 
 @torch.no_grad()
 def compute_dataset_std(dataset, channel_wise=False):
     """Compute the global standard deviation of HR velocity fields in a dataset.
+
+    Optimised for ``TensorDataset`` (and ``Subset`` of one) where the second
+    tensor is HR fields of shape [N, C, H, W]. Falls back to a streaming
+    two-pass computation for arbitrary datasets.
 
     Args:
         dataset: torch Dataset where each item is ``(cond, x_hr)``.
@@ -94,6 +99,10 @@ def compute_dataset_std(dataset, channel_wise=False):
 
 class EarlyStopper:
     """Classic early stopping helper.
+
+    Tracks the best metric seen so far and signals to stop when the metric
+    fails to improve by at least ``min_delta`` for ``patience`` consecutive
+    validations.
 
     Args:
         patience:  number of validations to wait without improvement.
@@ -168,41 +177,45 @@ def cleanup_old_files(pattern: str, keep_last_n: int = 4, logger=None,
 
 
 def create_logger(logging_dir):
-    """
-    Create a logger that writes to both stdout and a file.
+    """Create a logger that writes to both stdout and a file.
     If distributed is initialized, only rank 0 will log to the file.
     """
-    is_dist = dist.is_available() and dist.is_initialized() 
-    rank    = dist.get_rank() if is_dist else 0             
+    # Check if distributed is initialized
+    is_dist = dist.is_available() and dist.is_initialized() # Check whether distributed has been initialized
+    rank    = dist.get_rank() if is_dist else 0             # Defaults to rank 0 when uninitialized (to guard against single-GPU scenarios)
     
     if rank == 0:
-        handlers = [logging.StreamHandler()]                
+        handlers = [logging.StreamHandler()]                # Always output to the terminal
 
         if logging_dir is not None:
             os.makedirs(logging_dir, exist_ok=True)
-            handlers.append(logging.FileHandler(f"{logging_dir}/log.txt", mode='a')) 
+            handlers.append(logging.FileHandler(f"{logging_dir}/log.txt", mode='a')) # Write to file in append mode (mode='a')
         
         # Configure logging
         logging.basicConfig(
             level=logging.INFO,
-            format="[\033[34m%(asctime)s\033[0m] %(message)s", 
+            format="[\033[34m%(asctime)s\033[0m] %(message)s", # could consider injecting rank information into log records, [Rank %(rank)d], but the rank needs to be passed in.
             datefmt="%Y-%m-%d %H:%M:%S",
             handlers=handlers,
-            force=True
+            force=True # Override any existing logging configuration
         )
         logger = logging.getLogger(__name__)
     else:
+        # Log handling for non-Rank 0: only create the logger but don't record, to save resources
         logger = logging.getLogger(__name__)
-        logger.addHandler(logging.NullHandler())
+        logger.addHandler(logging.NullHandler()) # Swallow all log messages and output nothing
         
     return logger
 
 
 # ---------------------------------------------------------------------------
-#  非分块联合生成
+#  Non-chunked joint generation
 # ---------------------------------------------------------------------------
 class JointBlockGenerator:
-    """仅联合生成(无分块 rollout 展开)：一次 ODE 采样一整块 L 帧。
+    """Joint generation only (no chunked rollout unrolling): a single ODE samples an entire block of L frames.
+    
+    Difference from BlockFlowPredictor: it does not include a rollout/unrolling loop and only performs a single joint generation—
+    no temporal unrolling, computation cost = one ODE integration (O(ode_steps x F(L))), with frames within the block generated in parallel.
     """
 
     def __init__(self, model, block_len, noise_sampler, sampler_method="heun",
@@ -215,7 +228,7 @@ class JointBlockGenerator:
 
     @torch.no_grad()
     def generate(self, context, params, dt, x0=None, reverse=False):
-        """对当前历史条件联合生成一块 [B, L, C, H, W](单次 ODE,无展开)。"""
+        """Jointly generate a block [B, L, C, H, W] conditioned on the current history (single ODE, no unrolling)."""
         B, K, C, H, W = context.shape
         if x0 is None:
             x0 = self.noise_sampler(context.new_zeros(B, self.block_len * C, H, W))
@@ -233,13 +246,15 @@ class JointBlockGenerator:
     @torch.no_grad()
     def rollout_blocks(model, context, num_future_steps, params, dt,
                     sampler_method, ode_steps, noise_sampler, block_len):
-        """分块联合生成闭环 rollout:每步 ODE 联合采样 block_len 帧,窗口按块滑动。
+        """Chunked joint generation closed-loop rollout: at each step, the ODE jointly samples block_len frames, and the window slides chunk by chunk.
+
+        This corresponds to BlockFlowPredictor.rollout (the unrolling loop) on the training side. After the training side is changed to joint-only, this function is temporarily kept but commented out, to be uncommented and reused later when doing long-range chunked comparisons.
 
         Args:
-            context: [B, K, C, H, W] 真实初始窗口
+            context: [B, K, C, H, W] Ground-truth initial window
 
         Returns:
-            [B, T, C, H, W],T = num_future_steps(不足一块时截断)
+            [B, T, C, H, W],T = num_future_steps(Truncate when there is less than one block)
         """
         B, K, C, H, W = context.shape
         history = context
@@ -267,17 +282,18 @@ def integrate_ode(model, x0, parameters, num_steps=32, reverse=False, method="eu
     Methods supported: 'euler', 'heun2', 'rk4', 'dopri5'.
 
     Args:
-        model: FM 向量场
-        x0:     初始状态 [B, ...]
-        parameters: 标量条件（此处仅占位）
+        model: FM vector
+        x0: init state [B, ...]
+        parameters: Scalar conditioning (for the legacy interface only; 
+        under the new interface it is passed via model_kwargs, so this is just a placeholder here).
     """
-    B       = x0.shape[0]
-    device  = x0.device
+    B               = x0.shape[0]
+    device          = x0.device
 
     model.eval()
 
     def ode_func(t, xt):
-        t_batch = torch.full((B, 1), float(t), device=device, dtype=x0.dtype)
+        t_batch     = torch.full((B, 1), float(t), device=device, dtype=x0.dtype)
         if model_kwargs is not None:
             dx      = model(xt, t_batch, **model_kwargs)
         else:
@@ -285,9 +301,9 @@ def integrate_ode(model, x0, parameters, num_steps=32, reverse=False, method="eu
         return dx
 
     if reverse:
-        t_span = torch.linspace(1.0, 0.0, num_steps, device=device, dtype=x0.dtype)
+        t_span      = torch.linspace(1.0, 0.0, num_steps, device=device, dtype=x0.dtype)
     else:
-        t_span = torch.linspace(0.0, 1.0, num_steps, device=device, dtype=x0.dtype)
+        t_span      = torch.linspace(0.0, 1.0, num_steps, device=device, dtype=x0.dtype)
 
-    trajectory = odeint(ode_func, x0, t_span, method=method, rtol=rtol, atol=atol)
+    trajectory      = odeint(ode_func, x0, t_span, method=method, rtol=rtol, atol=atol)
     return trajectory[-1]
