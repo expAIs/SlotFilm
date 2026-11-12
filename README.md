@@ -18,13 +18,12 @@ Data-driven surrogates for turbulent flows increasingly rely on neural operators
 
 ```text
 .
-├── models/             # Core neural operator models (SlotFiLM, ConditionalFNO2D, SpectralConv)
-├── src/                # Metrics (DIV, E_TC, radial spectrum) and common utilities
+├── models/             # Core neural operator models
+├── src/                # Metrics and common utilities
 ├── scripts/            # Training and inference pipeline
 │   ├── runners/        # Shell scripts for training and evaluations
-│   └── analysis/       # Diagnostic probes (slot mixing matrix, FiLM gain)
-├── paper/              # Academic papers, LaTeX drafts, and benchmark results
-└── archive/            # Historical iterations and exploration baselines
+│   └── analysis/       # Diagnostic probes
+└── utils.py            # Some training utils
 ```
 
 ---
@@ -33,8 +32,8 @@ Data-driven surrogates for turbulent flows increasingly rely on neural operators
 
 ### 1. Requirements
 
-- Linux (Ubuntu 20.04/22.04 recommended)
-- Python >= 3.10, PyTorch >= 2.0
+- Linux (Ubuntu 22.04 recommended)
+- Python == 3.10, PyTorch == 2.1.2
 - CUDA compatible GPU
 
 ### 2. Training
@@ -60,8 +59,7 @@ If you find this work helpful, please cite our paper:
 ```bibtex
 @article{wang2026slotfilm,
   title={SlotFiLM: Condition-Adaptive Slot Mixing and Mode-Wise Modulation for Neural Operators},
-  author={Wang, Yuhao and Cai, Zhongxuan and Liu, Yinuo and Jiang, Tianjian and Wang, Yichen and Peng, Yuanxi},
+  author={Yuhao, Wang and Zhongxuan, Cai and Yinuo, Liu and Tianjian, Jiang and Yichen, Wang and Yuanxi, Peng},
   year={2026}
 }
 ```
-
